@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+AGENTS.md
+work/
+sources/
+course_report_app/data/jobs/
