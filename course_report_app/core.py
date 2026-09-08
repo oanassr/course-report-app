@@ -333,13 +333,32 @@ def compute_course_stats(analysis: dict[str, Any], match: dict[str, Any]) -> dic
     }
 
 
-def set_rtl(paragraph: Any) -> None:
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+def set_rtl(paragraph: Any, align: Any | None = WD_ALIGN_PARAGRAPH.RIGHT) -> None:
+    if align is not None:
+        paragraph.alignment = align
     ppr = paragraph._p.get_or_add_pPr()
     bidi = ppr.find(qn("w:bidi"))
     if bidi is None:
         bidi = OxmlElement("w:bidi")
         ppr.append(bidi)
+    bidi.set(qn("w:val"), "1")
+
+
+def set_run_rtl(run: Any) -> None:
+    rpr = run._element.get_or_add_rPr()
+    rtl = rpr.find(qn("w:rtl"))
+    if rtl is None:
+        rtl = OxmlElement("w:rtl")
+        rpr.append(rtl)
+    rtl.set(qn("w:val"), "1")
+
+
+def set_table_rtl(table: Any) -> None:
+    tbl_pr = table._tbl.tblPr
+    bidi = tbl_pr.find(qn("w:bidiVisual"))
+    if bidi is None:
+        bidi = OxmlElement("w:bidiVisual")
+        tbl_pr.append(bidi)
     bidi.set(qn("w:val"), "1")
 
 
@@ -354,10 +373,10 @@ def set_cell_text(cell: Any, text: str, bold: bool = False, size: int = 8, shade
         shd.set(qn("w:fill"), shade)
     cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
     p = cell.paragraphs[0]
-    p.alignment = align
     p.paragraph_format.space_after = Pt(0)
-    set_rtl(p)
+    set_rtl(p, align)
     run = p.add_run(text)
+    set_run_rtl(run)
     run.bold = bold
     run.font.name = "Arial"
     run._element.rPr.rFonts.set(qn("w:cs"), "Arial")
@@ -367,6 +386,7 @@ def set_cell_text(cell: Any, text: str, bold: bool = False, size: int = 8, shade
 
 
 def set_table_borders(table: Any) -> None:
+    set_table_rtl(table)
     borders = table._tbl.tblPr.first_child_found_in("w:tblBorders")
     if borders is None:
         borders = OxmlElement("w:tblBorders")
@@ -437,6 +457,7 @@ def add_header(doc: Document, template_path: Path) -> None:
         run.bold = True
         run.font.name = "Arial"
         run._element.rPr.rFonts.set(qn("w:cs"), "Arial")
+        set_run_rtl(run)
         run.font.size = Pt(11)
         run.font.color.rgb = RGBColor(0, 80, 30)
         right.add_run("\n")
@@ -448,6 +469,7 @@ def add_heading(doc: Document, text: str) -> None:
     p = doc.add_paragraph()
     set_rtl(p)
     run = p.add_run(text)
+    set_run_rtl(run)
     run.bold = True
     run.font.name = "Arial"
     run._element.rPr.rFonts.set(qn("w:cs"), "Arial")
@@ -459,6 +481,7 @@ def add_paragraph(doc: Document, text: str) -> None:
     set_rtl(p)
     p.paragraph_format.space_after = Pt(6)
     run = p.add_run(text)
+    set_run_rtl(run)
     run.font.name = "Arial"
     run._element.rPr.rFonts.set(qn("w:cs"), "Arial")
     run.font.size = Pt(11)
@@ -495,6 +518,7 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     program = analysis.get("meta", {}).get("program") or "تحليل بيانات الأعمال"
     terms = " و".join(analysis.get("selected_terms") or [])
     title_run = title.add_run(f"تقرير تحليل استبانة تقييم جودة المقررات الدراسية لبرنامج {program} للفصل 461")
+    set_run_rtl(title_run)
     title_run.bold = True
     title_run.font.name = "Arial"
     title_run._element.rPr.rFonts.set(qn("w:cs"), "Arial")
