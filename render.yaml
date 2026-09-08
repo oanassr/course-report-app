@@ -6,4 +6,4 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python course_report_app/server.py
     autoDeployTrigger: commit
-    healthCheckPath: /
+    healthCheckPath: /health

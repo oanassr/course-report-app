@@ -362,6 +362,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/health":
+            self.send_json({"status": "ok", "service": "course-report-app"})
+            return
         if parsed.path == "/":
             data = INDEX_HTML.encode("utf-8")
             self.send_response(200)
