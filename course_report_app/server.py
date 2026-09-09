@@ -13,7 +13,7 @@ from tempfile import SpooledTemporaryFile
 from core import JOBS_DIR, build_docx, create_analysis, ensure_dirs, load_analysis
 
 
-HOST = "0.0.0.0" if os.environ.get("RENDER") else "127.0.0.1"
+HOST = "0.0.0.0" if os.environ.get("PORT") or os.environ.get("RENDER") else "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8765"))
 
 
