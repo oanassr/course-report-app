@@ -14,6 +14,16 @@ from statistics import mean
 from typing import Any
 
 import pdfplumber
+
+try:
+    # PyMuPDF — optional fast text pass. ~30x faster than pdfplumber for plain
+    # text extraction; used only to detect course-summary pages so we can skip
+    # pdfplumber's expensive per-page parse for them. If it is unavailable the
+    # report reader transparently falls back to the original pdfplumber-only path.
+    import fitz  # type: ignore
+except Exception:  # pragma: no cover - environment without PyMuPDF
+    fitz = None  # type: ignore
+
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_ALIGN_VERTICAL
@@ -660,14 +670,93 @@ def _extract_item_rows(page: Any) -> tuple[dict[str, float], dict[str, float]]:
     return items, percents
 
 
+_SUMMARY_MARKERS = ("المعدل الكلي", "المجموع الكلي للاستبيان")
+
+
+def _is_summary_page(normalized_text: str) -> bool:
+    """Return True if a page is a course *summary* page (no per-item measurement
+    table). Detected from the fast fitz text pass so the expensive pdfplumber
+    parse can be skipped for it. To stay safe we only skip when a summary marker
+    is present AND the detail item-table header ("بنود التقييم") is absent — any
+    detail or ambiguous page still goes through the full pdfplumber path.
+    """
+    if "بنود التقييم" in normalized_text:
+        return False
+    return any(marker in normalized_text for marker in _SUMMARY_MARKERS)
+
+
+def _fast_page_texts(report_pdf: Path) -> list[str]:
+    """Extract every page's plain text with PyMuPDF (fitz). Returns [] if fitz is
+    unavailable or errors, so callers transparently fall back to pdfplumber."""
+    if fitz is None:
+        return []
+    doc = None
+    try:
+        doc = fitz.open(str(report_pdf))
+        return [doc[i].get_text("text") for i in range(doc.page_count)]
+    except Exception:
+        return []
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def _fitz_course_key(ftext: str) -> str | None:
+    """Best-effort course key from the fast fitz text, anchored at the
+    "رمز المقرر" label and ignoring Hijri year numbers (14xx). Returns None when
+    not confident so the caller falls back to the pdfplumber code reader. Used
+    only for summary pages, whose key must still match the pdfplumber result."""
+    norm = fix_pdf_arabic(ftext)
+    idx = norm.find("رمز المقرر")
+    if idx == -1:
+        idx = norm.find("رمز")
+    window = norm[idx: idx + 60] if idx != -1 else norm
+    for match in re.finditer(r"(\d)-[^\s:]{1,12}?(\d{3,4})", window):
+        digits = match.group(2)
+        if len(digits) == 4 and 1400 <= int(digits) <= 1499:
+            continue  # Hijri year, not a course number
+        key = code_key(match.group(0))
+        if key:
+            return key
+    return None
+
+
 def extract_report_occurrences(report_pdf: Path) -> list[ReportOccurrence]:
     cache_key = hashlib.sha256(report_pdf.read_bytes()).hexdigest()
     cached = _REPORT_CACHE.get(cache_key)
     if cached is not None:
         return deepcopy(cached)
     occurrences: list[ReportOccurrence] = []
+    # Fast pre-scan (fitz) drives a shortcut for course-summary pages, which have
+    # no measurement table and contribute only their page number. Skipping the
+    # pdfplumber parse for them cuts a large report's analysis time noticeably.
+    # Every other page falls through to the original pdfplumber logic unchanged.
+    fitz_texts = _fast_page_texts(report_pdf)
     with pdfplumber.open(str(report_pdf)) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
+            ftext = fitz_texts[page_number - 1] if page_number - 1 < len(fitz_texts) else ""
+            # Fast path: a course *summary* page has no measurement table and
+            # contributes only its page number (grouped by course key). When the
+            # fast fitz scan both marks it as a summary and yields a confident
+            # course key, skip pdfplumber's expensive per-page parse entirely.
+            if ftext and _is_summary_page(normalize_text(ftext)):
+                fast_key = _fitz_course_key(ftext)
+                if fast_key:
+                    occurrences.append(
+                        ReportOccurrence(
+                            page=page_number,
+                            code=display_code(fast_key),
+                            code_key=fast_key,
+                            name="",
+                            activity="",
+                            kind="ملخص",
+                            items={},
+                            percents={},
+                        )
+                    )
+                    continue
+            # Original path (unchanged): full pdfplumber parse for detail pages,
+            # ambiguous pages, and whenever the fast scan is unavailable.
             text = page.extract_text() or ""
             key = _extract_page_code(text)
             if not key:
