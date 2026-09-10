@@ -191,11 +191,9 @@ def code_key(raw_code: str) -> str | None:
     match = re.search(r"(\d)\D+(\d{3,4})", text)
     if not match:
         return None
-    number = match.group(2)
-    # Skip Hijri year–like numbers embedded in dates (e.g. 1446, 1448).
-    if _HIJRI_YEAR_PATTERN.match(number):
-        return None
-    return f"{match.group(1)}-{number}"
+    # A course number can legitimately start with 13xx (for example 1313).
+    # Normalize only padding zeros so exports such as 0102 and 102 match.
+    return f"{match.group(1)}-{int(match.group(2))}"
 
 
 def display_code(key: str) -> str:
@@ -478,12 +476,13 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
 
 
 def _extract_page_code(text: str) -> str | None:
-    normalized = normalize_text(text)
     # First pass: look for a code on the same line as "رمز المقرر".
     for line in text.splitlines():
-        line_norm = normalize_text(line)
+        line_norm = fix_pdf_arabic(line)
         if "رمز" in line_norm and "مقرر" in line_norm:
             key = code_key(line)
+            if not key:
+                key = code_key(line_norm)
             if key:
                 return key
         # Presentation form of "رمز المقرر" found in some PDFs.
@@ -493,7 +492,8 @@ def _extract_page_code(text: str) -> str | None:
                 return key
     # Second pass: pick the first course-code–like pattern in the page text,
     # skipping Hijri year numbers.
-    matches = re.findall(r"\d-[^\s:]{1,12}\d{3,4}", text)
+    fixed_text = fix_pdf_arabic(text)
+    matches = re.findall(r"\d-[^\s:]{1,12}\d{3,4}", fixed_text)
     for match in matches:
         key = code_key(match)  # code_key already filters Hijri years
         if key:
@@ -501,8 +501,25 @@ def _extract_page_code(text: str) -> str | None:
     return None
 
 
+def _fix_legacy_pdf_text(text: str) -> str:
+    """Normalize report metadata lines exported in visual Arabic order."""
+    fixed_lines: list[str] = []
+    for raw_line in (text or "").splitlines():
+        if any("\ufb50" <= char <= "\ufdff" or "\ufe70" <= char <= "\ufeff" for char in raw_line):
+            normalized = unicodedata.normalize("NFKC", raw_line)
+            tokens = [token for token in re.split(r"\s+", normalized) if token]
+            reversed_tokens = [
+                token[::-1] if re.search(r"[؀-ۿ]", token) else token
+                for token in reversed(tokens)
+            ]
+            fixed_lines.append(" ".join(reversed_tokens))
+        else:
+            fixed_lines.append(raw_line)
+    return "\n".join(fixed_lines)
+
+
 def _extract_page_name(text: str) -> str:
-    normalized = normalize_text(text)
+    normalized = _fix_legacy_pdf_text(text).replace("ـ", "")
     # Pattern 1: "اسم المقرر : <name>"
     match = re.search(
         r"اسم\s+المقرر\s*[:]\s*([^\n\r]{3,80}?)(?:\s+(?:طبيعة|رمز|نوع|عدد)|\s*$)",
@@ -522,7 +539,7 @@ def _extract_page_name(text: str) -> str:
 
 
 def _extract_page_display_code(text: str, key: str) -> str:
-    normalized = normalize_text(text)
+    normalized = _fix_legacy_pdf_text(text).replace("ـ", "")
     for line in normalized.splitlines():
         if "رمز" in line and "مقرر" in line:
             value = line.split("رمز المقرر", 1)[-1] if "رمز المقرر" in line else line
