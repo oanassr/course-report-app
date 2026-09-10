@@ -11,6 +11,8 @@ if not exist "%PYTHON%" (
   if errorlevel 1 exit /b 1
   "%PYTHON%" -m pip install -r "%BASE%requirements.txt"
   if errorlevel 1 exit /b 1
+  "%PYTHON%" "%BASE%course_report_app\preload_ocr.py"
+  if errorlevel 1 exit /b 1
 )
 
 "%PYTHON%" "%BASE%course_report_app\server.py"
