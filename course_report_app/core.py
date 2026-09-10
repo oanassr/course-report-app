@@ -315,10 +315,29 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                             hours=normalize_text(hours_cell),
                         )
                     )
-    if not courses:
-        courses = _ocr_plan_courses(plan_pdf)
-        if courses:
+    needs_ocr = any(has_private_glyphs(course.code) or has_private_glyphs(course.name) for course in courses)
+    if not courses or needs_ocr:
+        try:
+            ocr_courses = _ocr_plan_courses(plan_pdf)
+        except Exception as exc:
+            if not courses:
+                raise ValueError(f"تعذر تشغيل OCR العربي لقراءة الخطة المصورة: {exc}") from exc
+            ocr_courses = []
+        ocr_by_key = {course.code_key: course for course in ocr_courses}
+        for course in courses:
+            replacement = ocr_by_key.get(course.code_key)
+            if replacement:
+                course.code = replacement.code
+                course.name = replacement.name
+            else:
+                if has_private_glyphs(course.code):
+                    course.code = f"رمز غير مكتمل ({course.code_key})"
+                if has_private_glyphs(course.name):
+                    course.name = "مقرر غير مقروء (يحتاج تأكيد)"
+        if ocr_courses:
             meta["ocr_used"] = "true"
+        if not courses:
+            courses = ocr_courses
     if not courses:
         raise ValueError("تعذر استخراج مقررات الخطة حتى بعد تشغيل OCR العربي. تأكد من وضوح الصفحات وجودة المسح.")
     return courses, meta
@@ -439,9 +458,9 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
         source_code = course.code
         report_source = next((item for item in detail if item.name), None)
         if report_source:
-            if not source_name or has_private_glyphs(source_name):
+            if not source_name or has_private_glyphs(source_name) or source_name.startswith("مقرر غير مقروء"):
                 source_name = report_source.name
-            if not source_code or has_private_glyphs(source_code):
+            if not source_code or has_private_glyphs(source_code) or source_code.startswith("رمز غير مكتمل"):
                 source_code = report_source.code
         status = "مطابق" if detail else "غير موجود"
         if len(detail) > 1:
