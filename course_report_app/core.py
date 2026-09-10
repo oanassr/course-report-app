@@ -221,11 +221,11 @@ def course_code(raw_code: str, key: str | None = None) -> str:
 def plan_term(raw_term: str) -> str:
     # Check private-use glyph signatures first (special plan font).
     for signature, term in PLAN_TERM_GLYPHS.items():
-        if signature in raw_term:
+        if signature in raw_term or signature[::-1] in raw_term:
             return term
     fixed = fix_pdf_arabic(raw_term)
     for signature, term in PLAN_TERM_GLYPHS.items():
-        if signature in fixed:
+        if signature in fixed or signature[::-1] in fixed:
             return term
     # Look for known Arabic term names in the text.
     known = {
