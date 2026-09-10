@@ -233,6 +233,17 @@ INDEX_HTML = r"""<!doctype html>
       if (status.includes('تكرار')) return 'warn';
       return 'ok';
     }
+    async function readJson(response) {
+      const body = await response.text();
+      if (!body.trim()) {
+        throw new Error(`لم يصل رد من الخادم (HTTP ${response.status}). أعد المحاولة بعد لحظات.`);
+      }
+      try {
+        return JSON.parse(body);
+      } catch (error) {
+        throw new Error(`استجابة الخادم غير صالحة (HTTP ${response.status}). تحقق من سجل Render أو أعد المحاولة.`);
+      }
+    }
     function renderMatches(matches) {
       const tbody = $('matchesTable').querySelector('tbody');
       tbody.innerHTML = '';
@@ -269,7 +280,7 @@ INDEX_HTML = r"""<!doctype html>
       formData.set('terms', terms.join(','));
       try {
         const response = await fetch('/api/analyze', { method: 'POST', body: formData });
-        const data = await response.json();
+        const data = await readJson(response);
         if (!response.ok) throw new Error(data.error || 'تعذر تحليل الملفات');
         currentJob = data.job_id;
         currentMatches = data.matches;
@@ -299,7 +310,7 @@ INDEX_HTML = r"""<!doctype html>
       formData.set('plan', planInput.files[0]);
       try {
         const response = await fetch('/api/terms', { method: 'POST', body: formData });
-        const data = await response.json();
+        const data = await readJson(response);
         if (!response.ok) throw new Error(data.error || 'تعذر قراءة الفصول');
         const box = $('termsBox');
         box.innerHTML = '';
@@ -329,7 +340,7 @@ INDEX_HTML = r"""<!doctype html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ job_id: currentJob, matches: currentMatches })
         });
-        const data = await response.json();
+        const data = await readJson(response);
         if (!response.ok) throw new Error(data.error || 'تعذر توليد التقرير');
         $('downloadLink').href = data.download_url;
         $('summaryText').textContent = `تم توليد التقرير من ${data.selected_count} مقررات مؤكدة.`;
@@ -358,6 +369,7 @@ class AppHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -371,6 +383,7 @@ class AppHandler(BaseHTTPRequestHandler):
             data = INDEX_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
