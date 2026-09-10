@@ -170,10 +170,6 @@ INDEX_HTML = r"""<!doctype html>
             <label for="report">التقرير التفصيلي PDF</label>
             <input id="report" name="report" type="file" accept=".pdf" required>
           </div>
-          <div>
-            <label for="template">نموذج Word الرسمي DOCX</label>
-            <input id="template" name="template" type="file" accept=".docx" required>
-          </div>
         </div>
         <div class="toolbar">
           <button id="scanTermsBtn" type="button" class="secondary">قراءة فصول الخطة</button>
@@ -468,7 +464,7 @@ class AppHandler(BaseHTTPRequestHandler):
             counter += 1
             job_dir = JOBS_DIR / f"{job_id}-{counter}"
         job_dir.mkdir(parents=True)
-        for field_name, filename in [("plan", "plan.pdf"), ("report", "report.pdf"), ("template", "template.docx")]:
+        for field_name, filename in [("plan", "plan.pdf"), ("report", "report.pdf")]:
             field = form[field_name]
             with (job_dir / filename).open("wb") as output:
                 shutil.copyfileobj(field, output)

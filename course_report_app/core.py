@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-import zipfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from io import BytesIO
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -37,6 +35,20 @@ ITEMS = [
     "مصادر التعلم (كتب، مراجع، قواعد المعلومات، البلاك بورد... إلخ) كافية ومناسبة لمتطلبات المقرر",
     "تتوفر خدمات تهيئة ودعم فني مناسبة ساهمت في استخدامي الفعال لمصادر التعلم (كتب، مراجع، قواعد المعلومات، البلاك بورد... إلخ)",
 ]
+
+# Some university plan PDFs use a private-use font for the semester heading.
+# These signatures are a fallback for that export format; normal Arabic text
+# continues through the regular parser below.
+PLAN_TERM_GLYPHS = {
+    "\ue022\ue027\ue003\ue039\ue011\ue009": "الثاني",
+    "\ue009أل\ue038\ue034": "الأول",
+    "\ue028\ue008\ue003\ue013\ue011\ue009": "الخامس",
+    "\ue03a\ue011\ue003\ue039\ue011\ue009": "الثالث",
+    "\ue03b\ue002\ue003\ue023\ue011\ue009": "السابع",
+    "\ue03b\ue002\ue009\ue03c\ue011\ue009": "الرابع",
+    "\ue006\ue03d\ue003\ue023\ue011\ue009": "السادس",
+    "\ue007\ue008\ue003\ue039\ue011\ue009": "الثامن",
+}
 
 
 @dataclass
@@ -132,8 +144,35 @@ def display_code(key: str) -> str:
     return f"{credit}-نما{number}"
 
 
+def course_code(raw_code: str, key: str | None = None) -> str:
+    """Return the code text from the source instead of inventing a prefix."""
+    fixed = fix_pdf_arabic(raw_code)
+    found = re.findall(r"\d-[^\s:]+?\d{3,4}", fixed)
+    if found:
+        return found[-1]
+    # The report form puts the number and prefix in visual order, e.g.
+    # 3131حسب-3, which represents 3-حسب1313.
+    reversed_form = re.search(r"(\d{3,4})([^\s:]+)-(\d)", fixed)
+    if reversed_form:
+        prefix = reversed_form.group(2)
+        return f"{reversed_form.group(3)}-{prefix}{reversed_form.group(1)[::-1]}"
+    return display_code(key) if key else normalize_text(raw_code)
+
+
+def plan_term(raw_term: str) -> str:
+    fixed = fix_pdf_arabic(raw_term)
+    for signature, term in PLAN_TERM_GLYPHS.items():
+        if signature in raw_term or signature in fixed:
+            return term
+    return fixed
+
+
 def is_course_code(value: str) -> bool:
     return code_key(value) is not None
+
+
+def has_private_glyphs(value: str) -> bool:
+    return any("\ue000" <= char <= "\uf8ff" for char in value or "")
 
 
 def rating(avg: float) -> str:
@@ -162,7 +201,7 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
             for table in page.extract_tables():
                 if not table or len(table) < 3:
                     continue
-                term = fix_pdf_arabic(table[0][0] or "")
+                term = plan_term(table[0][0] or "")
                 if not term or "المجموع" in term:
                     continue
                 for row in table[2:]:
@@ -177,12 +216,17 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                     courses.append(
                         PlanCourse(
                             term=term,
-                            code=display_code(key),
+                            code=course_code(code_cell, key),
                             code_key=key,
                             name=fix_pdf_arabic(name_cell),
                             hours=normalize_text(hours_cell),
                         )
                     )
+    if not courses:
+        raise ValueError(
+            "تعذر قراءة الخطة: يبدو أن ملف PDF عبارة عن صور ممسوحة أو لا يحتوي على نص قابل للاستخراج. "
+            "استخدم نسخة PDF نصية من نظام الخطة أو حوّل الملف إلى PDF قابل للبحث."
+        )
     return courses, meta
 
 
@@ -201,11 +245,29 @@ def _extract_page_code(text: str) -> str | None:
 
 
 def _extract_page_name(text: str) -> str:
-    for line in text.splitlines():
-        if "ﺭﺮـﻘﻤﻟﺍ ﻢـﺳﺍ" in line:
-            before = line.split(":", 1)[0]
-            return fix_pdf_arabic(before)
+    fixed_text = fix_pdf_arabic(text)
+    for line in fixed_text.splitlines():
+        line = line.replace("ـ", "")
+        if "المقرر" not in line or "اسم" not in line:
+            continue
+        match = re.search(r"اسم\s+المقرر\s*:\s*(.+?)(?=\s+طبيعة\s+النشاط|\s+رمز\s+المقرر|$)", line)
+        if match:
+            return normalize_text(match.group(1)).rstrip(" -")
     return ""
+
+
+def _extract_page_display_code(text: str, key: str) -> str:
+    fixed_text = fix_pdf_arabic(text)
+    for line in fixed_text.splitlines():
+        line = line.replace("ـ", "")
+        if "رمز" in line and "المقرر" in line:
+            value = line.split("رمز المقرر", 1)[1]
+            value = value.split("رقم المقرر", 1)[0]
+            reversed_form = re.search(r"(\d{3,4})([^\s:]+)-(\d)", value)
+            if reversed_form:
+                return f"{reversed_form.group(3)}-{reversed_form.group(2)}{reversed_form.group(1)[::-1]}"
+            return display_code(key)
+    return display_code(key)
 
 
 def _extract_activity(text: str) -> str:
@@ -248,7 +310,7 @@ def extract_report_occurrences(report_pdf: Path) -> list[ReportOccurrence]:
             occurrences.append(
                 ReportOccurrence(
                     page=page_number,
-                    code=display_code(key),
+                    code=_extract_page_display_code(text, key),
                     code_key=key,
                     name=_extract_page_name(text),
                     activity=_extract_activity(text),
@@ -263,6 +325,11 @@ def extract_report_occurrences(report_pdf: Path) -> list[ReportOccurrence]:
 def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
     plan_courses, meta = extract_plan_courses(job_dir / "plan.pdf")
     report_occurrences = extract_report_occurrences(job_dir / "report.pdf")
+    if not any(item.kind == "تفصيلي" for item in report_occurrences):
+        raise ValueError(
+            "تعذر قراءة التقرير التفصيلي: لم يتم العثور على صفحات قياس تحتوي على بنود التقييم. "
+            "تأكد من رفع التقرير التفصيلي الأصلي وليس صورة ممسوحة أو صفحة ملخص فقط."
+        )
     by_key: dict[str, list[ReportOccurrence]] = defaultdict(list)
     for occurrence in report_occurrences:
         by_key[occurrence.code_key].append(occurrence)
@@ -274,6 +341,14 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
         occurrences = by_key.get(course.code_key, [])
         detail = [item for item in occurrences if item.kind == "تفصيلي"]
         summaries = [item for item in occurrences if item.kind == "ملخص"]
+        source_name = course.name
+        source_code = course.code
+        report_source = next((item for item in detail if item.name), None)
+        if report_source:
+            if not source_name or has_private_glyphs(source_name):
+                source_name = report_source.name
+            if not source_code or has_private_glyphs(source_code):
+                source_code = report_source.code
         status = "مطابق" if detail else "غير موجود"
         if len(detail) > 1:
             status = "مطابق مع تكرار"
@@ -282,9 +357,9 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
                 "selected": bool(detail),
                 "status": status,
                 "term": course.term,
-                "plan_code": course.code,
+                "plan_code": source_code,
                 "code_key": course.code_key,
-                "name": course.name,
+                "name": source_name,
                 "hours": course.hours,
                 "detail_pages": [item.page for item in detail],
                 "summary_pages": [item.page for item in summaries],
@@ -426,7 +501,7 @@ def repeat_header_row(row: Any) -> None:
     header.set(qn("w:val"), "true")
 
 
-def add_header(doc: Document, template_path: Path) -> None:
+def add_header(doc: Document) -> None:
     section = doc.sections[0]
     header = section.header
     for child in list(header._element):
@@ -444,12 +519,7 @@ def add_header(doc: Document, template_path: Path) -> None:
         left.add_run("\n")
     center = table.rows[0].cells[1].paragraphs[0]
     center.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    try:
-        with zipfile.ZipFile(template_path) as package:
-            logo = BytesIO(package.read("word/media/image1.jpeg"))
-        center.add_run().add_picture(logo, width=Cm(2.5))
-    except Exception:
-        center.add_run("King Khalid University")
+    center.add_run("King Khalid University")
     right = table.rows[0].cells[2].paragraphs[0]
     set_rtl(right)
     for line in ["المملكة العربية السعودية", "وزارة التعليم", "جامعة الملك خالد", "كلية الأعمال"]:
@@ -489,14 +559,13 @@ def add_paragraph(doc: Document, text: str) -> None:
 
 def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     analysis = load_analysis(job_dir)
-    template_path = job_dir / "template.docx"
     output_path = job_dir / "تقرير_تحليل_استبانة_المقررات.docx"
     selected = [match for match in confirmed_matches if match.get("selected")]
     for match in selected:
         stats = compute_course_stats(analysis, match)
         match.update(stats)
 
-    doc = Document(str(template_path))
+    doc = Document()
     body = doc._body._element
     for child in list(body):
         if child.tag != qn("w:sectPr"):
@@ -510,7 +579,7 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     section.right_margin = Cm(1.0)
     section.header_distance = Cm(0.4)
     section.footer_distance = Cm(0.4)
-    add_header(doc, template_path)
+    add_header(doc)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
