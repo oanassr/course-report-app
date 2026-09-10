@@ -273,8 +273,9 @@ def _ocr_pdf_blocks(pdf_path: Path) -> list[tuple[int, int, int, int, int, str]]
     blocks: list[tuple[int, int, int, int, int, str]] = []
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document, start=1):
-            # Use scale 1.5 to balance readability vs memory usage.
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            # 2x keeps small course-code cells readable without the memory cost
+            # of rendering the whole document at print resolution.
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
             image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
                 pixmap.height, pixmap.width, pixmap.n
             )
@@ -312,6 +313,8 @@ def _ocr_plan_courses(plan_pdf: Path) -> list[PlanCourse]:
         page_height = max((block[4] for block in page_blocks), default=1)
         for block in page_blocks:
             _, x0, y0, x1, y1, raw_line = block
+            center_x = (x0 + x1) / 2
+            center_y = (y0 + y1) / 2
             line = normalize_text(raw_line).replace("ـ", "")
             match = re.search(r"(?<!\d)(\d)\s*-\s*([؀-ۿA-Za-z]+)\s*(\d{3,4})(?!\d)", line)
             if not match:
@@ -319,15 +322,33 @@ def _ocr_plan_courses(plan_pdf: Path) -> list[PlanCourse]:
                 if match:
                     credit, prefix, number = match.group(3), match.group(2), match.group(1)
                 else:
-                    continue
+                    # Arabic OCR may drop the separator or the credit digit,
+                    # while preserving the course number and prefix.
+                    loose = re.search(r"(?<!\d)(\d{2,4})\s*([؀-ۿA-Za-z]+)\s*-?", line)
+                    if not loose:
+                        loose = re.search(r"(?<!\d)(\d{2,4})([؀-ۿA-Za-z]+)", line)
+                    if not loose:
+                        continue
+                    number, prefix = loose.group(1), loose.group(2)
+                    nearby_credits = []
+                    for other in page_blocks:
+                        _, ox0, oy0, ox1, oy1, other_text = other
+                        if other is block or abs(((oy0 + oy1) / 2) - center_y) > 38:
+                            continue
+                        if ox1 >= x0:
+                            continue
+                        credit_match = re.fullmatch(r"\s*([1-5])\s*", other_text)
+                        if credit_match:
+                            nearby_credits.append((abs(((oy0 + oy1) / 2) - center_y), credit_match.group(1)))
+                    if not nearby_credits:
+                        continue
+                    credit = min(nearby_credits)[1]
             else:
                 credit, prefix, number = match.group(1), match.group(2), match.group(3)
             if _HIJRI_YEAR_PATTERN.match(number):
                 continue
             key = f"{credit}-{number}"
             code = f"{credit}-{prefix}{number}"
-            center_x = (x0 + x1) / 2
-            center_y = (y0 + y1) / 2
             row_band = (
                 0 if center_y < page_height * 0.43
                 else 1 if center_y < page_height * 0.57
@@ -356,6 +377,8 @@ def _ocr_plan_courses(plan_pdf: Path) -> list[PlanCourse]:
                         (-len(cleaned), abs(((oy0 + oy1) / 2) - center_y), -other_center, cleaned)
                     )
             name = min(candidates)[3] if candidates else "مقرر مستخرج عبر OCR"
+            if "المجموع" in name:
+                continue
             courses.append(PlanCourse(term=term, code=code, code_key=key, name=name, hours=""))
     unique: dict[tuple[str, str], PlanCourse] = {}
     for course in courses:
@@ -389,8 +412,19 @@ def rating(avg: float) -> str:
     return "بحاجة إلى تحسين"
 
 
-def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, str]]:
-    cache_key = hashlib.sha256(plan_pdf.read_bytes()).hexdigest()
+def extract_plan_courses(
+    plan_pdf: Path,
+    *,
+    use_ocr: bool = True,
+) -> tuple[list[PlanCourse], dict[str, str]]:
+    """Extract plan courses, optionally deferring the expensive OCR pass.
+
+    The term-picker only needs semester headings, which are already available
+    from the PDF table structure.  Deferring OCR there keeps the initial UI
+    action responsive on small cloud instances.
+    """
+    digest = hashlib.sha256(plan_pdf.read_bytes()).hexdigest()
+    cache_key = f"{digest}:ocr={use_ocr}"
     cached = _PLAN_CACHE.get(cache_key)
     if cached:
         return deepcopy(cached[0]), dict(cached[1])
@@ -441,10 +475,10 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
     # Private-use glyphs hide the display text. OCR the plan when that happens
     # now that models are preloaded during deployment; the cache prevents a
     # second OCR pass when the user moves from terms to full analysis.
-    needs_ocr = not courses or any(
+    needs_ocr = use_ocr and (not courses or any(
         has_private_glyphs(course.code) or has_private_glyphs(course.name)
         for course in courses
-    )
+    ))
     ocr_courses: list[PlanCourse] = []
     if needs_ocr:
         try:
@@ -627,6 +661,10 @@ def _extract_item_rows(page: Any) -> tuple[dict[str, float], dict[str, float]]:
 
 
 def extract_report_occurrences(report_pdf: Path) -> list[ReportOccurrence]:
+    cache_key = hashlib.sha256(report_pdf.read_bytes()).hexdigest()
+    cached = _REPORT_CACHE.get(cache_key)
+    if cached is not None:
+        return deepcopy(cached)
     occurrences: list[ReportOccurrence] = []
     with pdfplumber.open(str(report_pdf)) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
@@ -647,6 +685,9 @@ def extract_report_occurrences(report_pdf: Path) -> list[ReportOccurrence]:
                     percents=percents,
                 )
             )
+    _REPORT_CACHE[cache_key] = deepcopy(occurrences)
+    if len(_REPORT_CACHE) > 4:
+        _REPORT_CACHE.pop(next(iter(_REPORT_CACHE)))
     return occurrences
 
 

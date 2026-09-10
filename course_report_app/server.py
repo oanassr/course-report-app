@@ -4,8 +4,11 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import urllib.parse
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
@@ -15,6 +18,49 @@ from core import JOBS_DIR, build_docx, create_analysis, ensure_dirs, load_analys
 
 HOST = "0.0.0.0" if os.environ.get("PORT") or os.environ.get("RENDER") or os.environ.get("HF_SPACE") else "127.0.0.1"
 PORT = int(os.environ.get("PORT", "7860" if os.environ.get("HF_SPACE") else "8765"))
+ANALYSIS_WORKERS = int(os.environ.get("ANALYSIS_WORKERS", "1" if os.environ.get("RENDER") else "2"))
+ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, ANALYSIS_WORKERS))
+ANALYSIS_JOBS: dict[str, dict[str, object]] = {}
+ANALYSIS_JOBS_LOCK = threading.Lock()
+
+
+def _set_job(job_id: str, **values: object) -> None:
+    with ANALYSIS_JOBS_LOCK:
+        job = ANALYSIS_JOBS.get(job_id)
+        if job is not None:
+            job.update(values)
+            job["updated_at"] = time.time()
+
+
+def _get_job(job_id: str) -> dict[str, object] | None:
+    with ANALYSIS_JOBS_LOCK:
+        job = ANALYSIS_JOBS.get(job_id)
+        return dict(job) if job is not None else None
+
+
+def _run_analysis_job(
+    job_id: str,
+    job_dir: Path,
+    selected_terms: list[str],
+    semester_label: str,
+) -> None:
+    _set_job(job_id, status="running", message="جاري تحليل الخطة والتقرير…")
+    try:
+        analysis = create_analysis(job_dir, selected_terms, semester_label=semester_label)
+    except Exception as exc:
+        _set_job(job_id, status="failed", error=str(exc), message="تعذر إكمال التحليل.")
+        return
+    _set_job(
+        job_id,
+        status="completed",
+        message="اكتمل التحليل.",
+        result={
+            "job_id": job_id,
+            "matches": analysis["matches"],
+            "all_terms": analysis["all_terms"],
+            "meta": analysis["meta"],
+        },
+    )
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -274,6 +320,34 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function waitForAnalysis(jobId) {
+      const startedAt = Date.now();
+      let transientFailures = 0;
+      while (true) {
+        try {
+          const response = await fetch(`/api/analyze/${encodeURIComponent(jobId)}`, {
+            cache: 'no-store'
+          });
+          const data = await readJson(response);
+          if (data.status === 'completed') return data.result;
+          if (data.status === 'failed') {
+            throw new Error(data.error || 'تعذر إكمال التحليل');
+          }
+          $('uploadMsg').innerHTML = `${data.message || 'جاري التحليل…'} <span class="spinner"></span>`;
+          transientFailures = 0;
+        } catch (err) {
+          transientFailures += 1;
+          // A proxy may briefly return 502 while the worker remains active.
+          // Keep polling instead of losing the uploaded job.
+          if (transientFailures >= 4 || Date.now() - startedAt > 12 * 60 * 1000) {
+            throw err;
+          }
+          $('uploadMsg').innerHTML = 'الخادم يعيد الاتصال بمهمة التحليل… <span class="spinner"></span>';
+        }
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    }
+
     function renderMatches(matches) {
       const tbody = $('matchesTable').querySelector('tbody');
       tbody.innerHTML = '';
@@ -333,8 +407,10 @@ INDEX_HTML = r"""<!doctype html>
       formData.set('terms', terms.join(','));
       try {
         const response = await fetch('/api/analyze', { method: 'POST', body: formData });
-        const data = await readJson(response);
-        if (!response.ok) throw new Error(data.error || 'تعذر تحليل الملفات');
+        const queued = await readJson(response);
+        if (!response.ok) throw new Error(queued.error || 'تعذر بدء التحليل');
+        $('uploadMsg').innerHTML = 'تم استلام الملفات. جاري التحليل في الخلفية… <span class="spinner"></span>';
+        const data = await waitForAnalysis(queued.job_id);
         currentJob = data.job_id;
         currentMatches = data.matches;
         renderMatches(currentMatches);
@@ -460,6 +536,30 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self.send_json({"status": "ok", "service": "course-report-app"})
             return
+        if parsed.path.startswith("/api/analyze/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            job = _get_job(job_id)
+            if job is None:
+                self.send_json({"error": "لم يتم العثور على مهمة التحليل"}, 404)
+                return
+            status = str(job.get("status", "queued"))
+            if status == "completed":
+                self.send_json({"status": status, "result": job.get("result")})
+                return
+            if status == "failed":
+                self.send_json(
+                    {
+                        "status": status,
+                        "error": job.get("error", "تعذر إكمال التحليل"),
+                    },
+                    500,
+                )
+                return
+            self.send_json(
+                {"status": status, "message": job.get("message", "جاري التحليل…")},
+                202,
+            )
+            return
         if parsed.path == "/":
             data = INDEX_HTML.encode("utf-8")
             self.send_response(200)
@@ -558,7 +658,9 @@ class AppHandler(BaseHTTPRequestHandler):
             shutil.copyfileobj(form["plan"], out)
         from core import extract_plan_courses, term_sort_key
 
-        courses, meta = extract_plan_courses(plan_path)
+        # Semester selection only needs table headings.  Avoid OCR here so the
+        # first click stays quick even for a long scanned plan.
+        courses, meta = extract_plan_courses(plan_path, use_ocr=False)
         seen: list[str] = []
         for course in courses:
             if course.term not in seen:
@@ -596,15 +698,20 @@ class AppHandler(BaseHTTPRequestHandler):
         terms_value = str(form.get("terms", ""))
         selected_terms = [t.strip() for t in terms_value.split(",") if t.strip()]
         semester_label = str(form.get("semester_label", "")).strip()
-        analysis = create_analysis(job_dir, selected_terms, semester_label=semester_label)
-        self.send_json(
-            {
-                "job_id": job_dir.name,
-                "matches": analysis["matches"],
-                "all_terms": analysis["all_terms"],
-                "meta": analysis["meta"],
+        with ANALYSIS_JOBS_LOCK:
+            ANALYSIS_JOBS[job_dir.name] = {
+                "status": "queued",
+                "message": "بانتظار بدء التحليل…",
+                "updated_at": time.time(),
             }
+        ANALYSIS_EXECUTOR.submit(
+            _run_analysis_job,
+            job_dir.name,
+            job_dir,
+            selected_terms,
+            semester_label,
         )
+        self.send_json({"job_id": job_dir.name, "status": "queued"}, 202)
 
     def handle_generate(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
