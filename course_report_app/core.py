@@ -44,15 +44,19 @@ ITEMS = [
 # These signatures are a fallback for that export format; normal Arabic text
 # continues through the regular parser below.
 PLAN_TERM_GLYPHS = {
-    "\ue022\ue027\ue003\ue039\ue011\ue009": "الثاني",
-    "\ue009أل\ue038\ue034": "الأول",
-    "\ue028\ue008\ue003\ue013\ue011\ue009": "الخامس",
-    "\ue03a\ue011\ue003\ue039\ue011\ue009": "الثالث",
-    "\ue03b\ue002\ue003\ue023\ue011\ue009": "السابع",
-    "\ue03b\ue002\ue009\ue03c\ue011\ue009": "الرابع",
-    "\ue006\ue03d\ue003\ue023\ue011\ue009": "السادس",
-    "\ue007\ue008\ue003\ue039\ue011\ue009": "الثامن",
+    "": "الثاني",
+    "أل": "الأول",
+    "": "الخامس",
+    "": "الثالث",
+    "": "السابع",
+    "": "الرابع",
+    "": "السادس",
+    "": "الثامن",
 }
+
+# Hijri year-like numbers that appear in dates inside PDF text — these codes
+# should not be mistaken for course numbers (e.g., 1446, 1447, 1448, 1449…).
+_HIJRI_YEAR_PATTERN = re.compile(r"1[34]\d{2}$")
 
 
 @dataclass
@@ -85,29 +89,73 @@ def normalize_text(text: str) -> str:
 
 
 def fix_pdf_arabic(text: str) -> str:
+    """Fix Arabic text that PDF readers extract in visual (RTL display) order.
+
+    Only applies the token-reversal heuristic to lines that appear visually
+    reversed — lines where the Arabic words are in the wrong order but each
+    word's letters are individually correct.  Plain Arabic text (already in
+    logical order) passes through unchanged.
+    """
     lines = [unicodedata.normalize("NFKC", line).strip() for line in (text or "").splitlines()]
     fixed_lines: list[str] = []
     for line in lines:
         tokens = [token for token in re.split(r"\s+", line) if token]
-        fixed: list[str] = []
-        for token in reversed(tokens):
-            if re.search(r"[\u0600-\u06FF]", token):
-                fixed.append(token[::-1])
-            else:
-                fixed.append(token)
-        if fixed:
+        # Heuristic: if the line contains Arabic but looks visually reversed
+        # (digits appear before the text that should follow them in RTL),
+        # reverse the token order and flip each Arabic token.  Otherwise keep
+        # the line as-is so correctly-ordered Arabic is not corrupted.
+        has_arabic = any(re.search(r"[؀-ۿ]", t) for t in tokens)
+        if has_arabic and _looks_visually_reversed(tokens):
+            fixed: list[str] = []
+            for token in reversed(tokens):
+                if re.search(r"[؀-ۿ]", token):
+                    fixed.append(token[::-1])
+                else:
+                    fixed.append(token)
             fixed_lines.append(" ".join(fixed))
-    return clean_arabic_text(" ".join(fixed_lines))
+        else:
+            fixed_lines.append(line)
+    return clean_arabic_text("\n".join(fixed_lines))
+
+
+def _looks_visually_reversed(tokens: list[str]) -> bool:
+    """Return True if the token sequence appears to be in visual RTL order.
+
+    In visual RTL order the last Arabic word of a sentence appears first.
+    A reliable signal: digits embedded in course-code–like patterns often
+    appear at the START of the token list when the line is reversed.
+    """
+    if not tokens:
+        return False
+    first = tokens[0]
+    # A line starting with a bare digit followed by a separator strongly
+    # suggests visual ordering (e.g. "3131ريتسجام-3" instead of "3-ريتسجام3131").
+    if re.match(r"^\d{3,4}[؀-ۿ]", first):
+        return True
+    # Arabic presentation-form characters (U+FB50–U+FDFF, U+FE70–U+FEFF)
+    # are written in visual order in some old PDFs.
+    if any("ﭐ" <= ch <= "﷿" or "ﹰ" <= ch <= "﻿" for ch in first):
+        return True
+    return False
 
 
 def clean_arabic_text(text: str) -> str:
     replacements = {
         "األول": "الأول",
         "االول": "الأول",
-        "األعمال": "الأعمال",
+        "ألاول": "الأول",
+        "الاول": "الأول",
+        "ألول": "الأول",
+        "الثانى": "الثاني",
+        "الثانى": "الثاني",
+        "ألعمال": "الأعمال",
+        "الأعمال": "الأعمال",
         "اإلحصائية": "الإحصائية",
-        "االعمال": "الأعمال",
-        "االلة": "الآلة",
+        "الإحصائية": "الإحصائية",
+        "اإلدارة": "الإدارة",
+        "الإدارة": "الإدارة",
+        "اإلدارى": "الإداري",
+        "اإلدارية": "الإدارية",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -140,7 +188,11 @@ def code_key(raw_code: str) -> str | None:
     match = re.search(r"(\d)\D+(\d{3,4})", text)
     if not match:
         return None
-    return f"{match.group(1)}-{match.group(2)}"
+    number = match.group(2)
+    # Skip Hijri year–like numbers embedded in dates (e.g. 1446, 1448).
+    if _HIJRI_YEAR_PATTERN.match(number):
+        return None
+    return f"{match.group(1)}-{number}"
 
 
 def display_code(key: str) -> str:
@@ -164,10 +216,30 @@ def course_code(raw_code: str, key: str | None = None) -> str:
 
 
 def plan_term(raw_term: str) -> str:
+    # Check private-use glyph signatures first (special plan font).
+    for signature, term in PLAN_TERM_GLYPHS.items():
+        if signature in raw_term:
+            return term
     fixed = fix_pdf_arabic(raw_term)
     for signature, term in PLAN_TERM_GLYPHS.items():
-        if signature in raw_term or signature in fixed:
+        if signature in fixed:
             return term
+    # Look for known Arabic term names in the text.
+    known = {
+        "الأول": "الأول", "الاول": "الأول", "اول": "الأول",
+        "الثاني": "الثاني", "الثانى": "الثاني",
+        "الثالث": "الثالث",
+        "الرابع": "الرابع",
+        "الخامس": "الخامس",
+        "السادس": "السادس",
+        "السابع": "السابع",
+        "الثامن": "الثامن",
+    }
+    text_norm = re.sub(r"\s+", "", fixed).replace("أ", "ا").replace("إ", "ا")
+    for key, canonical in known.items():
+        key_norm = re.sub(r"\s+", "", key).replace("أ", "ا").replace("إ", "ا")
+        if key_norm in text_norm:
+            return canonical
     return fixed
 
 
@@ -194,18 +266,21 @@ def _ocr_pdf_blocks(pdf_path: Path) -> list[tuple[int, int, int, int, int, str]]
             "Rec.ocr_version": OCRVersion.PPOCRV5,
         }
     )
-    blocks: list[tuple[int, int, int, int, str]] = []
+    blocks: list[tuple[int, int, int, int, int, str]] = []
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document, start=1):
-            # Keep OCR within Render's free-instance memory limit. The plan
-            # table remains readable at this scale and image-only PDFs still
-            # receive the OCR fallback.
+            # Use scale 1.5 to balance readability vs memory usage.
             pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-            image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
+            image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+                pixmap.height, pixmap.width, pixmap.n
+            )
             result = engine(image)
             boxes = getattr(result, "boxes", None)
             texts = getattr(result, "txts", None)
-            for box, text in zip(boxes if boxes is not None else (), texts if texts is not None else ()):
+            for box, text in zip(
+                boxes if boxes is not None else (),
+                texts if texts is not None else (),
+            ):
                 x0 = int(min(point[0] for point in box))
                 y0 = int(min(point[1] for point in box))
                 x1 = int(max(point[0] for point in box))
@@ -234,23 +309,35 @@ def _ocr_plan_courses(plan_pdf: Path) -> list[PlanCourse]:
         for block in page_blocks:
             _, x0, y0, x1, y1, raw_line = block
             line = normalize_text(raw_line).replace("ـ", "")
-            match = re.search(r"(?<!\d)(\d)\s*-\s*([\u0600-\u06ffA-Za-z]+)\s*(\d{3,4})(?!\d)", line)
+            match = re.search(r"(?<!\d)(\d)\s*-\s*([؀-ۿA-Za-z]+)\s*(\d{3,4})(?!\d)", line)
             if not match:
-                match = re.search(r"(?<!\d)(\d{3,4})\s*([\u0600-\u06ff]+)\s*-\s*(\d)(?!\d)", line)
+                match = re.search(r"(?<!\d)(\d{3,4})\s*([؀-ۿ]+)\s*-\s*(\d)(?!\d)", line)
                 if match:
                     credit, prefix, number = match.group(3), match.group(2), match.group(1)
                 else:
                     continue
             else:
                 credit, prefix, number = match.group(1), match.group(2), match.group(3)
+            if _HIJRI_YEAR_PATTERN.match(number):
+                continue
             key = f"{credit}-{number}"
             code = f"{credit}-{prefix}{number}"
             center_x = (x0 + x1) / 2
             center_y = (y0 + y1) / 2
-            row_band = 0 if center_y < page_height * 0.43 else 1 if center_y < page_height * 0.57 else 2 if center_y < page_height * 0.72 else 3
+            row_band = (
+                0 if center_y < page_height * 0.43
+                else 1 if center_y < page_height * 0.57
+                else 2 if center_y < page_height * 0.72
+                else 3
+            )
             right_table = center_x > page_width / 2
-            terms = (("الأول", "الثاني"), ("الثالث", "الرابع"), ("الخامس", "السادس"), ("السابع", "الثامن"))
-            term = terms[row_band][0 if right_table else 1]
+            all_terms = (
+                ("الأول", "الثاني"),
+                ("الثالث", "الرابع"),
+                ("الخامس", "السادس"),
+                ("السابع", "الثامن"),
+            )
+            term = all_terms[row_band][0 if right_table else 1]
             candidates = []
             for other in page_blocks:
                 _, ox0, oy0, ox1, oy1, other_text = other
@@ -260,8 +347,10 @@ def _ocr_plan_courses(plan_pdf: Path) -> list[PlanCourse]:
                 if other_center >= center_x or re.search(r"\d", other_text):
                     continue
                 cleaned = normalize_text(other_text).strip(" -")
-                if len(cleaned) > 2 and re.search(r"[\u0600-\u06ff]", cleaned):
-                    candidates.append((-len(cleaned), abs(((oy0 + oy1) / 2) - center_y), -other_center, cleaned))
+                if len(cleaned) > 2 and re.search(r"[؀-ۿ]", cleaned):
+                    candidates.append(
+                        (-len(cleaned), abs(((oy0 + oy1) / 2) - center_y), -other_center, cleaned)
+                    )
             name = min(candidates)[3] if candidates else "مقرر مستخرج عبر OCR"
             courses.append(PlanCourse(term=term, code=code, code_key=key, name=name, hours=""))
     unique: dict[tuple[str, str], PlanCourse] = {}
@@ -275,7 +364,12 @@ def is_course_code(value: str) -> bool:
 
 
 def has_private_glyphs(value: str) -> bool:
-    return any("\ue000" <= char <= "\uf8ff" for char in value or "")
+    # Unicode Private Use Areas: Basic (E000–F8FF) and Supplementary (F0000–FFFFF).
+    return any(
+        "" <= ch <= ""
+        or "\U000F0000" <= ch <= "\U000FFFFF"
+        for ch in value or ""
+    )
 
 
 def rating(avg: float) -> str:
@@ -297,21 +391,32 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
     if cached:
         return deepcopy(cached[0]), dict(cached[1])
     courses: list[PlanCourse] = []
-    meta = {"program": "", "college": "", "department": "", "plan": ""}
+    meta: dict[str, str] = {"program": "", "college": "", "department": "", "plan": ""}
     with pdfplumber.open(str(plan_pdf)) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        fixed_text = fix_pdf_arabic(text)
-        program_match = re.search(r"التخصص\s*:\s*([^\n]+?)(?:\s+\d{3,}|\s+الإصدار|$)", fixed_text)
-        if program_match:
-            meta["program"] = program_match.group(1).strip()
+        fixed_text = normalize_text(text)
+        # Try multiple label variants for program name.
+        for pattern in [
+            r"(?:التخصص|البرنامج|اسم\s+البرنامج|اسم\s+التخصص)\s*[:]\s*([^\n\r]{3,60}?)(?:\s+\d{3,}|\s+الإصدار|$)",
+        ]:
+            program_match = re.search(pattern, fixed_text)
+            if program_match:
+                name = program_match.group(1).strip(" :-")
+                if name and not name.isdigit():
+                    meta["program"] = name
+                    break
         for page in pdf.pages:
             for table in page.extract_tables():
-                if not table or len(table) < 3:
+                if not table or len(table) < 2:
                     continue
-                term = plan_term(table[0][0] or "")
-                if not term or "المجموع" in term:
+                # The term heading is typically in the first cell of the first row.
+                first_cell = (table[0][0] or "") if table[0] else ""
+                term = plan_term(first_cell)
+                if not term or "المجموع" in term or len(term) > 30:
                     continue
-                for row in table[2:]:
+                # Skip header row (index 1) — data starts at index 2.
+                data_start = 2 if len(table) >= 3 else 1
+                for row in table[data_start:]:
                     cells = [cell or "" for cell in row]
                     code_cell = next((cell for cell in reversed(cells) if is_course_code(cell)), "")
                     key = code_key(code_cell)
@@ -325,7 +430,7 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                             term=term,
                             code=course_code(code_cell, key),
                             code_key=key,
-                            name=fix_pdf_arabic(name_cell),
+                            name=normalize_text(name_cell),
                             hours=normalize_text(hours_cell),
                         )
                     )
@@ -356,7 +461,10 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
             if has_private_glyphs(course.name):
                 course.name = "مقرر غير مقروء (يحتاج تأكيد)"
     if not courses:
-        raise ValueError("تعذر استخراج مقررات الخطة حتى بعد تشغيل OCR العربي. تأكد من وضوح الصفحات وجودة المسح.")
+        raise ValueError(
+            "تعذر استخراج مقررات الخطة حتى بعد تشغيل OCR العربي. "
+            "تأكد من وضوح الصفحات وجودة المسح."
+        )
     _PLAN_CACHE[cache_key] = (deepcopy(courses), dict(meta))
     if len(_PLAN_CACHE) > 4:
         _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
@@ -364,68 +472,129 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
 
 
 def _extract_page_code(text: str) -> str | None:
+    normalized = normalize_text(text)
+    # First pass: look for a code on the same line as "رمز المقرر".
     for line in text.splitlines():
-        if "ﺭﺮــﻘـﻤﻟﺍ ﺰـﻣﺭ" in line or "رمز" in normalize_text(line):
+        line_norm = normalize_text(line)
+        if "رمز" in line_norm and "مقرر" in line_norm:
             key = code_key(line)
             if key:
                 return key
+        # Presentation form of "رمز المقرر" found in some PDFs.
+        if "ﺭﺮــﻘـﻤﻟﺍ ﺰـﻣﺭ" in line:
+            key = code_key(line)
+            if key:
+                return key
+    # Second pass: pick the first course-code–like pattern in the page text,
+    # skipping Hijri year numbers.
     matches = re.findall(r"\d-[^\s:]{1,12}\d{3,4}", text)
     for match in matches:
-        key = code_key(match)
-        if key and not key.endswith("1448"):
+        key = code_key(match)  # code_key already filters Hijri years
+        if key:
             return key
     return None
 
 
 def _extract_page_name(text: str) -> str:
-    fixed_text = fix_pdf_arabic(text)
-    for line in fixed_text.splitlines():
-        line = line.replace("ـ", "")
-        if "المقرر" not in line or "اسم" not in line:
-            continue
-        match = re.search(r"اسم\s+المقرر\s*:\s*(.+?)(?=\s+طبيعة\s+النشاط|\s+رمز\s+المقرر|$)", line)
-        if match:
-            return normalize_text(match.group(1)).rstrip(" -")
+    normalized = normalize_text(text)
+    # Pattern 1: "اسم المقرر : <name>"
+    match = re.search(
+        r"اسم\s+المقرر\s*[:]\s*([^\n\r]{3,80}?)(?:\s+(?:طبيعة|رمز|نوع|عدد)|\s*$)",
+        normalized,
+    )
+    if match:
+        return match.group(1).strip(" :-")
+    # Pattern 2: multiline — name may be on the next line after the label
+    for line in normalized.splitlines():
+        if "اسم" in line and "المقرر" in line:
+            parts = re.split(r"[:]", line, maxsplit=1)
+            if len(parts) == 2:
+                name = parts[1].strip(" :-")
+                if len(name) > 2:
+                    return name
     return ""
 
 
 def _extract_page_display_code(text: str, key: str) -> str:
-    fixed_text = fix_pdf_arabic(text)
-    for line in fixed_text.splitlines():
-        line = line.replace("ـ", "")
-        if "رمز" in line and "المقرر" in line:
-            value = line.split("رمز المقرر", 1)[1]
+    normalized = normalize_text(text)
+    for line in normalized.splitlines():
+        if "رمز" in line and "مقرر" in line:
+            value = line.split("رمز المقرر", 1)[-1] if "رمز المقرر" in line else line
             value = value.split("رقم المقرر", 1)[0]
             reversed_form = re.search(r"(\d{3,4})([^\s:]+)-(\d)", value)
             if reversed_form:
                 return f"{reversed_form.group(3)}-{reversed_form.group(2)}{reversed_form.group(1)[::-1]}"
+            direct = re.search(r"\d-[^\s:]{1,12}\d{3,4}", value)
+            if direct:
+                return direct.group(0)
             return display_code(key)
     return display_code(key)
 
 
 def _extract_activity(text: str) -> str:
-    if "ﻲﻠﻤﻋ" in text:
+    """Detect whether the activity type is practical (عملي) or theoretical (نظري).
+
+    Checks both Arabic presentation forms (present in some legacy PDFs) and
+    standard Unicode Arabic characters (after NFKC normalization).
+    """
+    normalized = normalize_text(text)
+    # Standard Arabic Unicode check (most PDFs after normalization).
+    if "عملي" in normalized or "عملى" in normalized:
         return "عملي"
-    if "ﻱﺮﻈﻧ" in text:
+    if "نظري" in normalized or "نظرى" in normalized:
+        return "نظري"
+    # Arabic Presentation Form A fallback (legacy/scanned PDFs).
+    if "ﻲﻠﻤﻋ" in text or "ﻋﻤﻠﻲ" in text:
+        return "عملي"
+    if "ﻱﺮﻈﻧ" in text or "ﻧﻈﺮﻱ" in text:
         return "نظري"
     return ""
 
 
 def _extract_item_rows(page: Any) -> tuple[dict[str, float], dict[str, float]]:
+    """Extract per-item averages and percentages from the measurement table.
+
+    The standard report table has:
+      column 0  → percentage (النسبة المئوية)
+      column 1  → average   (المتوسط الحسابي)
+      columns 2–N → intermediate data
+      last column → item number (1–11)
+
+    This function is tolerant of tables with fewer columns than expected and
+    tries alternative column positions when the standard ones fail.
+    """
     items: dict[str, float] = {}
     percents: dict[str, float] = {}
     for table in page.extract_tables():
         for row in table:
-            if not row or len(row) < 15:
+            if not row or len(row) < 3:
                 continue
-            item = normalize_text(row[-1] or "")
-            if not item.isdigit():
+            # Search for item number (1–11) in the last few cells.
+            item_num: int | None = None
+            for cell in reversed(row[-3:]):
+                val = normalize_text(cell or "")
+                if val.isdigit() and 1 <= int(val) <= 11:
+                    item_num = int(val)
+                    break
+            if item_num is None:
                 continue
-            number = int(item)
-            if 1 <= number <= 11:
+            key = str(item_num)
+            # Standard positions: col 0 = percent, col 1 = average.
+            try:
+                avg = float(normalize_text(row[1] or ""))
+                pct = float(normalize_text(row[0] or ""))
+                items[key] = avg
+                percents[key] = pct
+                continue
+            except (ValueError, IndexError):
+                pass
+            # Fallback: scan for a float in [1.0, 5.0] which is a Likert average.
+            for cell in row[1: len(row) - 1]:
                 try:
-                    items[str(number)] = float(normalize_text(row[1] or ""))
-                    percents[str(number)] = float(normalize_text(row[0] or ""))
+                    val = float(normalize_text(cell or ""))
+                    if 1.0 <= val <= 5.0:
+                        items[key] = val
+                        break
                 except ValueError:
                     pass
     return items, percents
@@ -455,8 +624,14 @@ def extract_report_occurrences(report_pdf: Path) -> list[ReportOccurrence]:
     return occurrences
 
 
-def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
+def create_analysis(
+    job_dir: Path,
+    selected_terms: list[str],
+    semester_label: str = "",
+) -> dict[str, Any]:
     plan_courses, meta = extract_plan_courses(job_dir / "plan.pdf")
+    if semester_label:
+        meta["semester_label"] = semester_label.strip()
     report_occurrences = extract_report_occurrences(job_dir / "report.pdf")
     if not any(item.kind == "تفصيلي" for item in report_occurrences):
         raise ValueError(
@@ -468,7 +643,10 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
         by_key[occurrence.code_key].append(occurrence)
 
     selected_term_keys = {term_key(term) for term in selected_terms}
-    selected = [course for course in plan_courses if not selected_term_keys or term_key(course.term) in selected_term_keys]
+    selected = [
+        course for course in plan_courses
+        if not selected_term_keys or term_key(course.term) in selected_term_keys
+    ]
     matches = []
     for course in selected:
         occurrences = by_key.get(course.code_key, [])
@@ -502,7 +680,9 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
         )
     all_terms = {course.term for course in plan_courses}
     if meta.get("ocr_used") == "true":
-        all_terms.update({"الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس", "السابع", "الثامن"})
+        all_terms.update(
+            {"الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس", "السابع", "الثامن"}
+        )
     analysis = {
         "meta": meta,
         "selected_terms": selected_terms,
@@ -510,7 +690,9 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
         "all_terms": sorted(all_terms, key=term_sort_key),
         "report_occurrences": [asdict(item) for item in report_occurrences],
     }
-    (job_dir / "analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+    (job_dir / "analysis.json").write_text(
+        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return analysis
 
 
@@ -525,10 +707,14 @@ def compute_course_stats(analysis: dict[str, Any], match: dict[str, Any]) -> dic
         for item in analysis["report_occurrences"]
         if item["code_key"] in source_keys and item["kind"] == "تفصيلي"
     ]
-    item_values = {}
-    raw_item_values = []
+    item_values: dict[str, float | None] = {}
+    raw_item_values: list[float] = []
     for item_number in range(1, 12):
-        values = [occ.items[str(item_number)] for occ in occurrences if str(item_number) in occ.items]
+        values = [
+            occ.items[str(item_number)]
+            for occ in occurrences
+            if str(item_number) in occ.items
+        ]
         raw_value = mean(values) if values else None
         if raw_value is not None:
             raw_item_values.append(raw_value)
@@ -573,7 +759,14 @@ def set_table_rtl(table: Any) -> None:
     bidi.set(qn("w:val"), "1")
 
 
-def set_cell_text(cell: Any, text: str, bold: bool = False, size: int = 8, shade: str | None = None, align: Any = WD_ALIGN_PARAGRAPH.CENTER) -> None:
+def set_cell_text(
+    cell: Any,
+    text: str,
+    bold: bool = False,
+    size: int = 8,
+    shade: str | None = None,
+    align: Any = WD_ALIGN_PARAGRAPH.CENTER,
+) -> None:
     cell.text = ""
     if shade:
         tc_pr = cell._tc.get_or_add_tcPr()
@@ -637,7 +830,7 @@ def repeat_header_row(row: Any) -> None:
     header.set(qn("w:val"), "true")
 
 
-def add_header(doc: Document) -> None:
+def add_header(doc: Document, college_ar: str = "كلية الأعمال", college_en: str = "College of Business") -> None:
     section = doc.sections[0]
     header = section.header
     for child in list(header._element):
@@ -646,7 +839,7 @@ def add_header(doc: Document) -> None:
     clear_borders(table)
     left = table.rows[0].cells[0].paragraphs[0]
     left.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    for line in ["Kingdom of Saudi Arabia", "Ministry of Education", "King Khalid University", "College of Business"]:
+    for line in ["Kingdom of Saudi Arabia", "Ministry of Education", "King Khalid University", college_en]:
         run = left.add_run(line)
         run.bold = True
         run.font.name = "Arial"
@@ -658,7 +851,7 @@ def add_header(doc: Document) -> None:
     center.add_run("King Khalid University")
     right = table.rows[0].cells[2].paragraphs[0]
     set_rtl(right)
-    for line in ["المملكة العربية السعودية", "وزارة التعليم", "جامعة الملك خالد", "كلية الأعمال"]:
+    for line in ["المملكة العربية السعودية", "وزارة التعليم", "جامعة الملك خالد", college_ar]:
         run = right.add_run(line)
         run.bold = True
         run.font.name = "Arial"
@@ -697,9 +890,19 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     analysis = load_analysis(job_dir)
     output_path = job_dir / "تقرير_تحليل_استبانة_المقررات.docx"
     selected = [match for match in confirmed_matches if match.get("selected")]
+    if not selected:
+        raise ValueError("لا توجد مقررات محددة لتوليد التقرير.")
     for match in selected:
         stats = compute_course_stats(analysis, match)
         match.update(stats)
+
+    meta = analysis.get("meta", {})
+    program = meta.get("program") or "تحليل بيانات الأعمال"
+    semester_label = meta.get("semester_label", "").strip()
+    terms_text = " و".join(analysis.get("selected_terms") or [])
+    # Use the explicit semester label if provided; otherwise fall back to
+    # the Arabic term names (e.g. "الأول و الثاني").
+    semester_display = semester_label if semester_label else terms_text
 
     doc = Document()
     body = doc._body._element
@@ -715,14 +918,20 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     section.right_margin = Cm(1.0)
     section.header_distance = Cm(0.4)
     section.footer_distance = Cm(0.4)
-    add_header(doc)
+
+    college_ar = meta.get("college_ar", "كلية الأعمال")
+    college_en = meta.get("college_en", "College of Business")
+    add_header(doc, college_ar=college_ar, college_en=college_en)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     set_rtl(title)
-    program = analysis.get("meta", {}).get("program") or "تحليل بيانات الأعمال"
-    terms = " و".join(analysis.get("selected_terms") or [])
-    title_run = title.add_run(f"تقرير تحليل استبانة تقييم جودة المقررات الدراسية لبرنامج {program} للفصل 461")
+    title_text = (
+        f"تقرير تحليل استبانة تقييم جودة المقررات الدراسية"
+        f" لبرنامج {program}"
+        + (f" للفصل {semester_display}" if semester_display else "")
+    )
+    title_run = title.add_run(title_text)
     set_run_rtl(title_run)
     title_run.bold = True
     title_run.font.name = "Arial"
@@ -733,7 +942,9 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     add_paragraph(
         doc,
         f"يحلل هذا التقرير نتائج استبانة تقييم المقررات المطروحة وفق الخطة الدراسية لبرنامج {program}. "
-        f"تم اعتماد مقررات {terms} وعددها {len(selected)} مقررات، مع تثبيت رموز وأسماء المقررات كما وردت في الخطة.",
+        f"تم اعتماد {len(selected)} مقررات"
+        + (f" من {terms_text}" if terms_text else "")
+        + "، مع تثبيت رموز وأسماء المقررات كما وردت في الخطة.",
     )
     add_paragraph(
         doc,
@@ -745,61 +956,104 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     table = doc.add_table(rows=1 + len(ITEMS), cols=1 + len(selected))
     table.autofit = True
     set_table_borders(table)
-    for col, header in enumerate(["البند"] + [f"{m['name']}\n{m['plan_code']}" for m in selected]):
+    for col, header in enumerate(
+        ["البند"] + [f"{m['name']}\n{m['plan_code']}" for m in selected]
+    ):
         set_cell_text(table.rows[0].cells[col], header, bold=True, size=7, shade="1F4E79")
     repeat_header_row(table.rows[0])
     for row_idx, item_text in enumerate(ITEMS, start=1):
-        set_cell_text(table.rows[row_idx].cells[0], item_text, size=7, shade="EAF2F8", align=WD_ALIGN_PARAGRAPH.RIGHT)
+        set_cell_text(
+            table.rows[row_idx].cells[0],
+            item_text,
+            size=7,
+            shade="EAF2F8",
+            align=WD_ALIGN_PARAGRAPH.RIGHT,
+        )
         for col_idx, match in enumerate(selected, start=1):
             value = match["item_values"].get(str(row_idx))
-            set_cell_text(table.rows[row_idx].cells[col_idx], "-" if value is None else f"{value:.2f}", size=8)
+            set_cell_text(
+                table.rows[row_idx].cells[col_idx],
+                "-" if value is None else f"{value:.2f}",
+                size=8,
+            )
 
     add_heading(doc, "المتوسطات الحسابية لتقييم المقررات")
     summary = doc.add_table(rows=1 + len(selected), cols=6)
     set_table_borders(summary)
-    for col, header in enumerate(["المقرر", "الفصل في الخطة", "المتوسط الحسابي", "النسبة المئوية", "التقدير", "صفحات القياس"]):
+    for col, header in enumerate(
+        ["المقرر", "الفصل في الخطة", "المتوسط الحسابي", "النسبة المئوية", "التقدير", "صفحات القياس"]
+    ):
         set_cell_text(summary.rows[0].cells[col], header, bold=True, size=8, shade="1F4E79")
     repeat_header_row(summary.rows[0])
     for row_idx, match in enumerate(selected, start=1):
+        avg_str = f"{match['average']:.2f}" if match.get("average") is not None else "-"
+        pct_str = f"{match['percent']:.2f}" if match.get("percent") is not None else "-"
         values = [
             f"{match['name']}\n{match['plan_code']}",
             match["term"],
-            f"{match['average']:.2f}",
-            f"{match['percent']:.2f}",
-            match["rating"],
-            ", ".join(map(str, match["detail_pages"])),
+            avg_str,
+            pct_str,
+            match.get("rating", "-"),
+            ", ".join(map(str, match.get("detail_pages", []))),
         ]
         for col, value in enumerate(values):
-            set_cell_text(summary.rows[row_idx].cells[col], value, size=8, align=WD_ALIGN_PARAGRAPH.RIGHT if col == 0 else WD_ALIGN_PARAGRAPH.CENTER)
+            set_cell_text(
+                summary.rows[row_idx].cells[col],
+                value,
+                size=8,
+                align=WD_ALIGN_PARAGRAPH.RIGHT if col == 0 else WD_ALIGN_PARAGRAPH.CENTER,
+            )
 
-    averages = sorted([(match["average"], match) for match in selected], key=lambda item: item[0])
+    # Sort only courses that have a computed average.
+    scored = [(m["average"], m) for m in selected if m.get("average") is not None]
+    averages = sorted(scored, key=lambda item: item[0])
+
     add_heading(doc, "تحليل النتائج")
     add_heading(doc, "نقاط القوة")
+    top_n = averages[-3:] if len(averages) >= 3 else averages
+    top_text = "، ".join(
+        f"{m['name']} ({m['plan_code']}) بمتوسط {avg:.2f}"
+        for avg, m in reversed(top_n)
+    ) if top_n else "لا توجد بيانات كافية"
     add_paragraph(
         doc,
-        "أعلى المقررات في النتائج هي: "
-        + "، ".join(f"{match['name']} ({match['plan_code']}) بمتوسط {avg:.2f}" for avg, match in reversed(averages[-3:]))
-        + ". وتعكس هذه النتائج مستوى مرتفعاً في وضوح معلومات المقرر، وتنوع استراتيجيات التعليم والتقييم، وفاعلية التدريس.",
+        f"أعلى المقررات في النتائج هي: {top_text}. "
+        "وتعكس هذه النتائج مستوى مرتفعاً في وضوح معلومات المقرر، وتنوع استراتيجيات التعليم والتقييم، وفاعلية التدريس.",
     )
-    add_heading(doc, "نقاط التحسين")
+
+    add_heading(doc, "مجالات التحسين")
+    bottom_n = averages[:3] if len(averages) >= 3 else averages
+    bottom_text = "، ".join(
+        f"{m['name']} ({m['plan_code']}) بمتوسط {avg:.2f}"
+        for avg, m in bottom_n
+    ) if bottom_n else "لا توجد بيانات كافية"
     add_paragraph(
         doc,
-        "تتركز فرص التحسين في المقررات الأقل متوسطاً: "
-        + "، ".join(f"{match['name']} ({match['plan_code']}) بمتوسط {avg:.2f}" for avg, match in averages[:3])
-        + ". ويوصى بتحليل البنود التفصيلية لهذه المقررات، خاصة البنود المرتبطة بتنوع استراتيجيات التعليم والتقييم، والتغذية الراجعة، ومصادر التعلم.",
+        f"تتركز فرص التحسين في المقررات الأقل متوسطاً: {bottom_text}. "
+        "ويوصى بتحليل البنود التفصيلية لهذه المقررات، خاصة البنود المرتبطة بتنوع استراتيجيات التعليم والتقييم، والتغذية الراجعة، ومصادر التعلم.",
     )
 
     add_heading(doc, "مصادر القياس ومعالجة التكرار")
     sources = doc.add_table(rows=1 + len(selected), cols=4)
     set_table_borders(sources)
-    for col, header in enumerate(["رمز الخطة", "اسم المقرر في الخطة", "صفحات القياس المستخدمة", "ملاحظة المطابقة"]):
+    for col, header in enumerate(
+        ["رمز الخطة", "اسم المقرر في الخطة", "صفحات القياس المستخدمة", "ملاحظة المطابقة"]
+    ):
         set_cell_text(sources.rows[0].cells[col], header, bold=True, size=8, shade="1F4E79")
     repeat_header_row(sources.rows[0])
     for row_idx, match in enumerate(selected, start=1):
-        note = "احتسب المتوسط من جميع صفحات القياس التفصيلية دون صفحات الملخص."
-        if len(match.get("detail_pages", [])) > 1:
-            note = "ظهر المقرر في أكثر من موضع، واحتسب المتوسط من جميع صفحات القياس التفصيلية دون صفحات الملخص."
-        values = [match["plan_code"], match["name"], ", ".join(map(str, match["detail_pages"])), note]
+        pages = match.get("detail_pages", [])
+        note = (
+            "ظهر المقرر في أكثر من موضع، واحتسب المتوسط من جميع صفحات القياس التفصيلية دون صفحات الملخص."
+            if len(pages) > 1
+            else "احتسب المتوسط من جميع صفحات القياس التفصيلية دون صفحات الملخص."
+        )
+        values = [
+            match["plan_code"],
+            match["name"],
+            ", ".join(map(str, pages)),
+            note,
+        ]
         for col, value in enumerate(values):
             set_cell_text(sources.rows[row_idx].cells[col], value, size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
 
@@ -809,14 +1063,35 @@ def build_docx(job_dir: Path, confirmed_matches: list[dict[str, Any]]) -> Path:
     for col, header in enumerate(["مجال التحسين", "الإجراء المقترح", "المسؤول", "الإطار الزمني"]):
         set_cell_text(improvement.rows[0].cells[col], header, bold=True, size=8, shade="1F4E79")
     repeat_header_row(improvement.rows[0])
-    rows = [
-        ["تحسين المقررات الأقل متوسطاً", "مراجعة البنود الأقل في كل مقرر، وتطوير أنشطة تطبيقية وحالات عملية مرتبطة بتحليل بيانات الأعمال.", "منسق البرنامج وأعضاء هيئة التدريس", "الفصل التالي"],
-        ["توحيد جودة التغذية الراجعة", "تحديد آلية واضحة لإعلان درجات الأنشطة والاختبارات وتقديم تغذية راجعة منتظمة للطلاب.", "أعضاء هيئة التدريس", "طوال الفصل"],
-        ["تعزيز مصادر التعلم", "تحديث مصادر التعلم الرقمية، وتفعيل استخدام البلاك بورد وقواعد المعلومات لدعم تعلم الطلاب.", "منسق المقرر والدعم الفني", "قبل بداية الفصل"],
-        ["المتابعة الدورية", "إعادة قياس أثر التحسين في نهاية الفصل ومقارنة المتوسطات بنتائج هذا التقرير.", "لجنة الجودة ومنسق البرنامج", "نهاية الفصل"],
+    improvement_rows = [
+        [
+            "تحسين المقررات الأقل متوسطاً",
+            f"مراجعة البنود الأقل في كل مقرر، وتطوير أنشطة تطبيقية وحالات عملية مرتبطة ببرنامج {program}.",
+            "منسق البرنامج وأعضاء هيئة التدريس",
+            "الفصل التالي",
+        ],
+        [
+            "توحيد جودة التغذية الراجعة",
+            "تحديد آلية واضحة لإعلان درجات الأنشطة والاختبارات وتقديم تغذية راجعة منتظمة للطلاب.",
+            "أعضاء هيئة التدريس",
+            "طوال الفصل",
+        ],
+        [
+            "تعزيز مصادر التعلم",
+            "تحديث مصادر التعلم الرقمية، وتفعيل استخدام البلاك بورد وقواعد المعلومات لدعم تعلم الطلاب.",
+            "منسق المقرر والدعم الفني",
+            "قبل بداية الفصل",
+        ],
+        [
+            "المتابعة الدورية",
+            "إعادة قياس أثر التحسين في نهاية الفصل ومقارنة المتوسطات بنتائج هذا التقرير.",
+            "لجنة الجودة ومنسق البرنامج",
+            "نهاية الفصل",
+        ],
     ]
-    for row_idx, row in enumerate(rows, start=1):
+    for row_idx, row in enumerate(improvement_rows, start=1):
         for col, value in enumerate(row):
             set_cell_text(improvement.rows[row_idx].cells[col], value, size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
     doc.save(str(output_path))
     return output_path

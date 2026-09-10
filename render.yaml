@@ -7,3 +7,8 @@ services:
     startCommand: python course_report_app/server.py
     autoDeployTrigger: commit
     healthCheckPath: /health
+    # Render free tier has 512 MB RAM. OCR on large scanned plans can be
+    # memory-intensive; the app skips OCR when text extraction succeeds.
+    envVars:
+      - key: RENDER
+        value: "1"
