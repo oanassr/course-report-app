@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import gc
+import hashlib
 import re
 import unicodedata
+from copy import deepcopy
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,6 +25,7 @@ from docx.shared import Cm, Pt, RGBColor
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 JOBS_DIR = DATA_DIR / "jobs"
+_PLAN_CACHE: dict[str, tuple[list["PlanCourse"], dict[str, str]]] = {}
 ITEMS = [
     "تم تزويدي في بداية دراستي للمقرر ببيانات شاملة عنه: مخرجات التعلم، استراتيجيات التعليم والتعلم، طرق التقييم",
     "يراعي المنهج الدراسي التطورات العلمية والتقنية والمهنية في مجال التخصص",
@@ -289,6 +292,10 @@ def rating(avg: float) -> str:
 
 
 def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, str]]:
+    cache_key = hashlib.sha256(plan_pdf.read_bytes()).hexdigest()
+    cached = _PLAN_CACHE.get(cache_key)
+    if cached:
+        return deepcopy(cached[0]), dict(cached[1])
     courses: list[PlanCourse] = []
     meta = {"program": "", "college": "", "department": "", "plan": ""}
     with pdfplumber.open(str(plan_pdf)) as pdf:
@@ -350,6 +357,9 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                 course.name = "مقرر غير مقروء (يحتاج تأكيد)"
     if not courses:
         raise ValueError("تعذر استخراج مقررات الخطة حتى بعد تشغيل OCR العربي. تأكد من وضوح الصفحات وجودة المسح.")
+    _PLAN_CACHE[cache_key] = (deepcopy(courses), dict(meta))
+    if len(_PLAN_CACHE) > 4:
+        _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
     return courses, meta
 
 
