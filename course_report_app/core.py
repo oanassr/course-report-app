@@ -5,6 +5,7 @@ import gc
 import hashlib
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -26,6 +27,8 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 JOBS_DIR = DATA_DIR / "jobs"
 _PLAN_CACHE: dict[str, tuple[list["PlanCourse"], dict[str, str]]] = {}
+_OCR_ENGINE: Any | None = None
+_REPORT_CACHE: dict[str, list["ReportOccurrence"]] = {}
 ITEMS = [
     "تم تزويدي في بداية دراستي للمقرر ببيانات شاملة عنه: مخرجات التعلم، استراتيجيات التعليم والتعلم، طرق التقييم",
     "يراعي المنهج الدراسي التطورات العلمية والتقنية والمهنية في مجال التخصص",
@@ -254,18 +257,21 @@ def _ocr_pdf_blocks(pdf_path: Path) -> list[tuple[int, int, int, int, int, str]]
             "الملف صورة ممسوحة ولا يحتوي نصًا. لم يتم تثبيت مكونات OCR اللازمة لقراءة العربية."
         ) from exc
 
-    engine = RapidOCR(
-        params={
-            "Det.engine_type": EngineType.ONNXRUNTIME,
-            "Det.lang_type": LangDet.CH,
-            "Det.model_type": ModelType.MOBILE,
-            "Det.ocr_version": OCRVersion.PPOCRV5,
-            "Rec.engine_type": EngineType.ONNXRUNTIME,
-            "Rec.lang_type": LangRec.ARABIC,
-            "Rec.model_type": ModelType.MOBILE,
-            "Rec.ocr_version": OCRVersion.PPOCRV5,
-        }
-    )
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        _OCR_ENGINE = RapidOCR(
+            params={
+                "Det.engine_type": EngineType.ONNXRUNTIME,
+                "Det.lang_type": LangDet.CH,
+                "Det.model_type": ModelType.MOBILE,
+                "Det.ocr_version": OCRVersion.PPOCRV5,
+                "Rec.engine_type": EngineType.ONNXRUNTIME,
+                "Rec.lang_type": LangRec.ARABIC,
+                "Rec.model_type": ModelType.MOBILE,
+                "Rec.ocr_version": OCRVersion.PPOCRV5,
+            }
+        )
+    engine = _OCR_ENGINE
     blocks: list[tuple[int, int, int, int, int, str]] = []
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document, start=1):
