@@ -167,6 +167,99 @@ def plan_term(raw_term: str) -> str:
     return fixed
 
 
+def _ocr_pdf_blocks(pdf_path: Path) -> list[tuple[int, int, int, int, int, str]]:
+    """Render an image-only PDF and read Arabic text when OCR is installed."""
+    try:
+        import fitz
+        import numpy as np
+        from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+    except ImportError as exc:
+        raise ValueError(
+            "الملف صورة ممسوحة ولا يحتوي نصًا. لم يتم تثبيت مكونات OCR اللازمة لقراءة العربية."
+        ) from exc
+
+    engine = RapidOCR(
+        params={
+            "Det.engine_type": EngineType.ONNXRUNTIME,
+            "Det.lang_type": LangDet.CH,
+            "Det.model_type": ModelType.MOBILE,
+            "Det.ocr_version": OCRVersion.PPOCRV5,
+            "Rec.engine_type": EngineType.ONNXRUNTIME,
+            "Rec.lang_type": LangRec.ARABIC,
+            "Rec.model_type": ModelType.MOBILE,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+        }
+    )
+    blocks: list[tuple[int, int, int, int, str]] = []
+    with fitz.open(str(pdf_path)) as document:
+        for page_number, page in enumerate(document, start=1):
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+            image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
+            result = engine(image)
+            boxes = getattr(result, "boxes", None)
+            texts = getattr(result, "txts", None)
+            for box, text in zip(boxes if boxes is not None else (), texts if texts is not None else ()):
+                x0 = int(min(point[0] for point in box))
+                y0 = int(min(point[1] for point in box))
+                x1 = int(max(point[0] for point in box))
+                y1 = int(max(point[1] for point in box))
+                if text:
+                    blocks.append((page_number, x0, y0, x1, y1, str(text)))
+    return blocks
+
+
+def _ocr_pdf_text(pdf_path: Path) -> str:
+    return "\n".join(block[-1] for block in _ocr_pdf_blocks(pdf_path))
+
+
+def _ocr_plan_courses(plan_pdf: Path) -> list[PlanCourse]:
+    blocks = _ocr_pdf_blocks(plan_pdf)
+    courses: list[PlanCourse] = []
+    by_page: dict[int, list[tuple[int, int, int, int, int, str]]] = defaultdict(list)
+    for block in blocks:
+        by_page[block[0]].append(block)
+    for page_blocks in by_page.values():
+        page_width = max((block[3] for block in page_blocks), default=1)
+        page_height = max((block[4] for block in page_blocks), default=1)
+        for block in page_blocks:
+            _, x0, y0, x1, y1, raw_line = block
+            line = normalize_text(raw_line).replace("ـ", "")
+            match = re.search(r"(?<!\d)(\d)\s*-\s*([\u0600-\u06ffA-Za-z]+)\s*(\d{3,4})(?!\d)", line)
+            if not match:
+                match = re.search(r"(?<!\d)(\d{3,4})\s*([\u0600-\u06ff]+)\s*-\s*(\d)(?!\d)", line)
+                if match:
+                    credit, prefix, number = match.group(3), match.group(2), match.group(1)
+                else:
+                    continue
+            else:
+                credit, prefix, number = match.group(1), match.group(2), match.group(3)
+            key = f"{credit}-{number}"
+            code = f"{credit}-{prefix}{number}"
+            center_x = (x0 + x1) / 2
+            center_y = (y0 + y1) / 2
+            row_band = 0 if center_y < page_height * 0.43 else 1 if center_y < page_height * 0.57 else 2 if center_y < page_height * 0.72 else 3
+            right_table = center_x > page_width / 2
+            terms = (("الأول", "الثاني"), ("الثالث", "الرابع"), ("الخامس", "السادس"), ("السابع", "الثامن"))
+            term = terms[row_band][0 if right_table else 1]
+            candidates = []
+            for other in page_blocks:
+                _, ox0, oy0, ox1, oy1, other_text = other
+                other_center = (ox0 + ox1) / 2
+                if abs(((oy0 + oy1) / 2) - center_y) > 45 or other is block:
+                    continue
+                if other_center >= center_x or re.search(r"\d", other_text):
+                    continue
+                cleaned = normalize_text(other_text).strip(" -")
+                if len(cleaned) > 2 and re.search(r"[\u0600-\u06ff]", cleaned):
+                    candidates.append((-len(cleaned), abs(((oy0 + oy1) / 2) - center_y), -other_center, cleaned))
+            name = min(candidates)[3] if candidates else "مقرر مستخرج عبر OCR"
+            courses.append(PlanCourse(term=term, code=code, code_key=key, name=name, hours=""))
+    unique: dict[tuple[str, str], PlanCourse] = {}
+    for course in courses:
+        unique.setdefault((term_key(course.term), course.code_key), course)
+    return list(unique.values())
+
+
 def is_course_code(value: str) -> bool:
     return code_key(value) is not None
 
@@ -223,10 +316,11 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                         )
                     )
     if not courses:
-        raise ValueError(
-            "تعذر قراءة الخطة: يبدو أن ملف PDF عبارة عن صور ممسوحة أو لا يحتوي على نص قابل للاستخراج. "
-            "استخدم نسخة PDF نصية من نظام الخطة أو حوّل الملف إلى PDF قابل للبحث."
-        )
+        courses = _ocr_plan_courses(plan_pdf)
+        if courses:
+            meta["ocr_used"] = "true"
+    if not courses:
+        raise ValueError("تعذر استخراج مقررات الخطة حتى بعد تشغيل OCR العربي. تأكد من وضوح الصفحات وجودة المسح.")
     return courses, meta
 
 
@@ -367,11 +461,14 @@ def create_analysis(job_dir: Path, selected_terms: list[str]) -> dict[str, Any]:
                 "source_keys": [course.code_key],
             }
         )
+    all_terms = {course.term for course in plan_courses}
+    if meta.get("ocr_used") == "true":
+        all_terms.update({"الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس", "السابع", "الثامن"})
     analysis = {
         "meta": meta,
         "selected_terms": selected_terms,
         "matches": matches,
-        "all_terms": sorted({course.term for course in plan_courses}, key=term_sort_key),
+        "all_terms": sorted(all_terms, key=term_sort_key),
         "report_occurrences": [asdict(item) for item in report_occurrences],
     }
     (job_dir / "analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")

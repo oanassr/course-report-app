@@ -275,7 +275,10 @@ INDEX_HTML = r"""<!doctype html>
         currentMatches = data.matches;
         renderMatches(currentMatches);
         $('confirmPanel').classList.remove('hidden');
-        $('uploadMsg').textContent = `تم العثور على ${data.matches.length} مقررات في الفصول المحددة.`;
+        const ocrNote = data.meta && data.meta.ocr_used === 'true'
+          ? ' تم استخدام OCR؛ راجع الرموز والأسماء في خطوة التأكيد.'
+          : '';
+        $('uploadMsg').textContent = `تم العثور على ${data.matches.length} مقررات في الفصول المحددة.${ocrNote}`;
         setStep(2);
       } catch (error) {
         $('uploadMsg').textContent = error.message;
@@ -306,7 +309,10 @@ INDEX_HTML = r"""<!doctype html>
           label.innerHTML = `<input type="checkbox" name="terms" value="${term}" ${checked ? 'checked' : ''}> ${term}`;
           box.appendChild(label);
         });
-        $('termsMsg').textContent = `تم العثور على ${data.terms.length} فصول في الخطة.`;
+        const ocrNote = data.meta && data.meta.ocr_used === 'true'
+          ? ' تم استخدام OCR؛ راجع النتائج قبل التحليل.'
+          : '';
+        $('termsMsg').textContent = `تم العثور على ${data.terms.length} فصول في الخطة.${ocrNote}`;
       } catch (error) {
         $('termsMsg').textContent = error.message;
       } finally {
@@ -452,6 +458,11 @@ class AppHandler(BaseHTTPRequestHandler):
         for course in courses:
             if course.term not in terms:
                 terms.append(course.term)
+        if meta.get("ocr_used") == "true":
+            terms = sorted(
+                {"الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس", "السابع", "الثامن", *terms},
+                key=term_sort_key,
+            )
         self.send_json({"terms": sorted(terms, key=term_sort_key), "meta": meta})
 
     def handle_analyze(self) -> None:
