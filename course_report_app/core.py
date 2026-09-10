@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import re
 import unicodedata
 from collections import defaultdict
@@ -193,7 +194,10 @@ def _ocr_pdf_blocks(pdf_path: Path) -> list[tuple[int, int, int, int, int, str]]
     blocks: list[tuple[int, int, int, int, str]] = []
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document, start=1):
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+            # Keep OCR within Render's free-instance memory limit. The plan
+            # table remains readable at this scale and image-only PDFs still
+            # receive the OCR fallback.
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
             image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
             result = engine(image)
             boxes = getattr(result, "boxes", None)
@@ -205,6 +209,9 @@ def _ocr_pdf_blocks(pdf_path: Path) -> list[tuple[int, int, int, int, int, str]]
                 y1 = int(max(point[1] for point in box))
                 if text:
                     blocks.append((page_number, x0, y0, x1, y1, str(text)))
+            del result, image, pixmap
+            if page_number % 3 == 0:
+                gc.collect()
     return blocks
 
 
@@ -315,29 +322,32 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                             hours=normalize_text(hours_cell),
                         )
                     )
-    needs_ocr = any(has_private_glyphs(course.code) or has_private_glyphs(course.name) for course in courses)
-    if not courses or needs_ocr:
+    # Private-use glyphs can hide the display text while the embedded PDF
+    # text still exposes reliable course keys. Do not OCR the whole text plan
+    # in that case; report names/codes fill confirmed matches later.
+    needs_ocr = not courses
+    ocr_courses: list[PlanCourse] = []
+    if needs_ocr:
         try:
             ocr_courses = _ocr_plan_courses(plan_pdf)
         except Exception as exc:
             if not courses:
                 raise ValueError(f"تعذر تشغيل OCR العربي لقراءة الخطة المصورة: {exc}") from exc
-            ocr_courses = []
-        ocr_by_key = {course.code_key: course for course in ocr_courses}
-        for course in courses:
-            replacement = ocr_by_key.get(course.code_key)
-            if replacement:
-                course.code = replacement.code
-                course.name = replacement.name
-            else:
-                if has_private_glyphs(course.code):
-                    course.code = f"رمز غير مكتمل ({course.code_key})"
-                if has_private_glyphs(course.name):
-                    course.name = "مقرر غير مقروء (يحتاج تأكيد)"
         if ocr_courses:
             meta["ocr_used"] = "true"
         if not courses:
             courses = ocr_courses
+    ocr_by_key = {course.code_key: course for course in ocr_courses}
+    for course in courses:
+        replacement = ocr_by_key.get(course.code_key)
+        if replacement:
+            course.code = replacement.code
+            course.name = replacement.name
+        else:
+            if has_private_glyphs(course.code):
+                course.code = f"رمز غير مكتمل ({course.code_key})"
+            if has_private_glyphs(course.name):
+                course.name = "مقرر غير مقروء (يحتاج تأكيد)"
     if not courses:
         raise ValueError("تعذر استخراج مقررات الخطة حتى بعد تشغيل OCR العربي. تأكد من وضوح الصفحات وجودة المسح.")
     return courses, meta
