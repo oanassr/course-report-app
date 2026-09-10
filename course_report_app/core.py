@@ -438,10 +438,13 @@ def extract_plan_courses(plan_pdf: Path) -> tuple[list[PlanCourse], dict[str, st
                             hours=normalize_text(hours_cell),
                         )
                     )
-    # Private-use glyphs can hide the display text while the embedded PDF
-    # text still exposes reliable course keys. Do not OCR the whole text plan
-    # in that case; report names/codes fill confirmed matches later.
-    needs_ocr = not courses
+    # Private-use glyphs hide the display text. OCR the plan when that happens
+    # now that models are preloaded during deployment; the cache prevents a
+    # second OCR pass when the user moves from terms to full analysis.
+    needs_ocr = not courses or any(
+        has_private_glyphs(course.code) or has_private_glyphs(course.name)
+        for course in courses
+    )
     ocr_courses: list[PlanCourse] = []
     if needs_ocr:
         try:
